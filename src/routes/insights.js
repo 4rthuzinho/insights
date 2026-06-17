@@ -1,29 +1,47 @@
 const express = require("express");
 const { randomUUID } = require("node:crypto");
-const { readFile, writeFile, mkdir } = require("node:fs/promises");
-const path = require("node:path");
+const db = require("../database");
 
 const router = express.Router();
-const DATA_FILE = path.join(__dirname, "..", "data", "insights.json");
 const VALID_STATUS = new Set(["aberto", "resolvido"]);
 
-async function readInsights() {
-  try {
-    const content = await readFile(DATA_FILE, "utf8");
-    return JSON.parse(content);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error);
+        return;
+      }
 
-    await writeInsights([]);
-    return [];
-  }
+      resolve(rows);
+    });
+  });
 }
 
-async function writeInsights(insights) {
-  await mkdir(path.dirname(DATA_FILE), { recursive: true });
-  await writeFile(DATA_FILE, `${JSON.stringify(insights, null, 2)}\n`, "utf8");
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (error, row) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(row);
+    });
+  });
+}
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(error) {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve({ changes: this.changes, lastID: this.lastID });
+    });
+  });
 }
 
 function validateInsight(payload) {
@@ -60,7 +78,6 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({ erro: "Dados invalidos", detalhes: errors });
     }
 
-    const insights = await readInsights();
     const insight = {
       id: randomUUID(),
       regraId: req.body.regraId,
@@ -71,8 +88,29 @@ router.post("/", async (req, res, next) => {
       criadoEm: new Date().toISOString()
     };
 
-    insights.push(insight);
-    await writeInsights(insights);
+    await dbRun(
+      `
+        INSERT INTO insights (
+          id,
+          regraId,
+          titulo,
+          descricao,
+          contatoId,
+          status,
+          criadoEm
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        insight.id,
+        insight.regraId,
+        insight.titulo,
+        insight.descricao,
+        insight.contatoId,
+        insight.status,
+        insight.criadoEm
+      ]
+    );
 
     return res.status(201).json(insight);
   } catch (error) {
@@ -82,7 +120,21 @@ router.post("/", async (req, res, next) => {
 
 router.get("/", async (req, res, next) => {
   try {
-    const insights = await readInsights();
+    const insights = await dbAll(
+      `
+        SELECT
+          id,
+          regraId,
+          titulo,
+          descricao,
+          contatoId,
+          status,
+          criadoEm
+        FROM insights
+        ORDER BY criadoEm DESC
+      `
+    );
+
     return res.json(insights);
   } catch (error) {
     return next(error);
@@ -91,8 +143,21 @@ router.get("/", async (req, res, next) => {
 
 router.get("/:id", async (req, res, next) => {
   try {
-    const insights = await readInsights();
-    const insight = insights.find((item) => item.id === req.params.id);
+    const insight = await dbGet(
+      `
+        SELECT
+          id,
+          regraId,
+          titulo,
+          descricao,
+          contatoId,
+          status,
+          criadoEm
+        FROM insights
+        WHERE id = ?
+      `,
+      [req.params.id]
+    );
 
     if (!insight) {
       return res.status(404).json({ erro: "Insight nao encontrado" });
@@ -112,10 +177,12 @@ router.put("/:id", async (req, res, next) => {
       return res.status(400).json({ erro: "Dados invalidos", detalhes: errors });
     }
 
-    const insights = await readInsights();
-    const index = insights.findIndex((item) => item.id === req.params.id);
+    const insightExistente = await dbGet(
+      "SELECT criadoEm FROM insights WHERE id = ?",
+      [req.params.id]
+    );
 
-    if (index === -1) {
+    if (!insightExistente) {
       return res.status(404).json({ erro: "Insight nao encontrado" });
     }
 
@@ -126,11 +193,29 @@ router.put("/:id", async (req, res, next) => {
       descricao: req.body.descricao,
       contatoId: req.body.contatoId,
       status: req.body.status,
-      criadoEm: insights[index].criadoEm
+      criadoEm: insightExistente.criadoEm
     };
 
-    insights[index] = insightAtualizado;
-    await writeInsights(insights);
+    await dbRun(
+      `
+        UPDATE insights
+        SET
+          regraId = ?,
+          titulo = ?,
+          descricao = ?,
+          contatoId = ?,
+          status = ?
+        WHERE id = ?
+      `,
+      [
+        insightAtualizado.regraId,
+        insightAtualizado.titulo,
+        insightAtualizado.descricao,
+        insightAtualizado.contatoId,
+        insightAtualizado.status,
+        insightAtualizado.id
+      ]
+    );
 
     return res.json(insightAtualizado);
   } catch (error) {
@@ -140,15 +225,11 @@ router.put("/:id", async (req, res, next) => {
 
 router.delete("/:id", async (req, res, next) => {
   try {
-    const insights = await readInsights();
-    const insightExiste = insights.some((item) => item.id === req.params.id);
+    const result = await dbRun("DELETE FROM insights WHERE id = ?", [req.params.id]);
 
-    if (!insightExiste) {
+    if (result.changes === 0) {
       return res.status(404).json({ erro: "Insight nao encontrado" });
     }
-
-    const insightsAtualizados = insights.filter((item) => item.id !== req.params.id);
-    await writeInsights(insightsAtualizados);
 
     return res.status(204).send();
   } catch (error) {
